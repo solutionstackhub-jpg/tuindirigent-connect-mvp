@@ -1,0 +1,262 @@
+// Tuindirigent — marketplace payouts.
+// Single source of truth for the payout layer. The subscription tables of the
+// live app are deliberately not modelled here: this schema only adds, it never
+// touches what already works.
+
+generator client {
+  provider = "prisma-client-js"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+/// Mirrors the Stripe Express account states the designer is shown.
+enum ConnectStatus {
+  NOT_STARTED
+  INCOMPLETE
+  UNDER_REVIEW
+  READY
+  RESTRICTED
+}
+
+enum ListingType {
+  DESIGN
+  PACKAGE
+}
+
+enum PurchaseStatus {
+  PENDING
+  PAID
+  PARTIALLY_REFUNDED
+  REFUNDED
+  DISPUTE_OPEN
+  DISPUTE_WON
+  DISPUTE_LOST
+}
+
+enum LedgerType {
+  SALE
+  TRANSFER
+  REVERSAL
+  REFUND
+  SHARED_COST
+  DISPUTE_HOLD
+  DISPUTE_RELEASE
+  BALANCE_SETTLEMENT
+  BALANCE_CARRIED
+}
+
+enum DocumentType {
+  INVOICE
+  CREDIT_NOTE
+}
+
+/// Platform-wide settings. The VAT rate is config, never a constant in code.
+model Config {
+  id                    Int      @id @default(1)
+  vatRateBp             Int      @default(2100) // 21,00% in basis points
+  designerShareBp       Int      @default(7000) // 70,00% of the ex-VAT amount
+  defaultHoldDays       Int      @default(21)
+  selfBillingTerms      String   @default("v1.2")
+  invoiceSeries         String   @default("TD-2026")
+  hideUnonboardedList   Boolean  @default(false) // feature flag for rollout
+  platformName          String   @default("Tuindirigent B.V.")
+  platformVatNumber     String   @default("NL863291041B01")
+  platformAddress       String   @default("Keizersgracht 241, 1016 EA Amsterdam")
+  updatedAt             DateTime @updatedAt
+}
+
+model Designer {
+  id                    String        @id @default(cuid())
+  name                  String
+  studioName            String
+  email                 String        @unique
+  slug                  String        @unique
+  avatarUrl             String
+  headerUrl             String
+  city                  String
+  bio                   String
+
+  // --- Stripe Connect Express ---
+  stripeAccountId       String?       @unique
+  connectStatus         ConnectStatus @default(NOT_STARTED)
+  chargesEnabled        Boolean       @default(false)
+  payoutsEnabled        Boolean       @default(false)
+  detailsSubmitted      Boolean       @default(false)
+  requirementsDue       String[]      @default([])
+
+  // --- Dutch VAT / self-billing ---
+  vatNumber             String?
+  vatNumberValid        Boolean       @default(false)
+  address               String?
+  selfBillingAcceptedAt DateTime?
+  selfBillingVersion    String?
+
+  // --- payout controls ---
+  holdDaysOverride      Int?
+  payoutsOnHold         Boolean       @default(false)
+  holdReason            String?
+  /// Negative balance carried when a reversal could not be taken from Stripe.
+  carriedBalanceCents   Int           @default(0)
+
+  listings              Listing[]
+  purchases             Purchase[]
+  ledger                LedgerEntry[]
+  documents             Document[]
+  createdAt             DateTime      @default(now())
+}
+
+model Listing {
+  id                 String      @id @default(cuid())
+  designer           Designer    @relation(fields: [designerId], references: [id])
+  designerId         String
+  type               ListingType
+  title              String
+  slug               String      @unique
+  summary            String
+  description        String
+  coverUrl           String
+  gallery            String[]    @default([])
+  style              String
+  plotSize           String
+  deliverables       String[]    @default([])
+  /// Marketplace pricing lives in the app and is passed inline at checkout.
+  priceInclVatCents  Int
+  published          Boolean     @default(false)
+  purchases          Purchase[]
+  createdAt          DateTime    @default(now())
+}
+
+/// Everything the invoice and the payout need is snapshotted here at checkout.
+/// Later changes to the designer, the VAT rate or the commission never move it.
+model Purchase {
+  id                    String         @id @default(cuid())
+  listing               Listing        @relation(fields: [listingId], references: [id])
+  listingId             String
+  designer              Designer       @relation(fields: [designerId], references: [id])
+  designerId            String
+
+  buyerName             String
+  buyerEmail            String
+  paymentMethod         String         @default("card") // card | ideal
+
+  // --- Stripe objects ---
+  checkoutSessionId     String?        @unique
+  paymentIntentId       String?        @unique
+  chargeId              String?        @unique
+  transferId            String?
+
+  // --- snapshot: the numbers that must match Stripe to the cent ---
+  grossCents            Int
+  vatRateBp             Int
+  netCents              Int
+  vatCents              Int
+  designerShareBp       Int
+  designerNetCents      Int
+  designerVatCents      Int
+  transferCents         Int
+  applicationFeeCents   Int
+  designerVatNumber     String
+  designerLegalName     String
+  designerAddress       String
+
+  status                PurchaseStatus @default(PENDING)
+  refundedCents         Int            @default(0)
+  reversedCents         Int            @default(0)
+  sharedCostCents       Int            @default(0)
+  payoutHoldUntil       DateTime?
+  paidOutAt             DateTime?
+  disputeFeeCents       Int            @default(0)
+
+  ledger                LedgerEntry[]
+  documents             Document[]
+  createdAt             DateTime       @default(now())
+
+  @@index([designerId, status])
+}
+
+/// Human-readable money trail. A designer must always be able to see why a
+/// payout was reduced, so every movement gets a row with a reason.
+model LedgerEntry {
+  id             String     @id @default(cuid())
+  purchase       Purchase?  @relation(fields: [purchaseId], references: [id])
+  purchaseId     String?
+  designer       Designer   @relation(fields: [designerId], references: [id])
+  designerId     String
+  type           LedgerType
+  /// Signed, from the designer's point of view. Integer cents, always.
+  amountCents    Int
+  /// Message key plus its parameters, so the same row renders in Dutch and
+  /// English and a wording change never rewrites history.
+  reasonKey      String
+  reasonParams   Json       @default("{}")
+  stripeObjectId String?
+  createdAt      DateTime   @default(now())
+
+  @@index([designerId, createdAt])
+}
+
+/// Self-billed invoice or credit note. Immutable once issued.
+model Document {
+  id               String       @id @default(cuid())
+  type             DocumentType
+  series           String
+  number           Int
+  fullNumber       String       @unique
+  purchase         Purchase     @relation(fields: [purchaseId], references: [id])
+  purchaseId       String
+  designer         Designer     @relation(fields: [designerId], references: [id])
+  designerId       String
+  relatedDocument  Document?    @relation("CreditNoteOf", fields: [relatedId], references: [id])
+  relatedId        String?
+  creditNotes      Document[]   @relation("CreditNoteOf")
+
+  // --- snapshot of both parties at the moment of issue ---
+  sellerName       String
+  sellerVatNumber  String
+  sellerAddress    String
+  buyerName        String
+  buyerVatNumber   String
+  buyerAddress     String
+
+  netCents         Int
+  vatRateBp        Int
+  vatCents         Int
+  totalCents       Int
+  termsVersion     String
+  description      String
+
+  /// Derived from the Stripe event, so a webhook replay can never mint a
+  /// second document or burn a number.
+  idempotencyKey   String       @unique
+  issuedAt         DateTime     @default(now())
+
+  @@unique([series, number])
+  @@index([designerId, issuedAt])
+}
+
+/// One row per series. Locked with SELECT ... FOR UPDATE so numbering is
+/// gap-free under concurrent webhooks. A Postgres sequence cannot be used:
+/// a rolled-back transaction would leave a hole.
+model DocumentCounter {
+  series     String   @id
+  lastNumber Int      @default(0)
+  updatedAt  DateTime @updatedAt
+}
+
+/// Every Stripe event we have seen. The processed marker is what makes replays
+/// and out-of-order delivery safe.
+model WebhookEvent {
+  id          String    @id // Stripe event id, e.g. evt_...
+  type        String
+  endpoint    String    // "platform" | "connect"
+  payload     Json
+  receivedAt  DateTime  @default(now())
+  processedAt DateTime?
+  replayCount Int       @default(0)
+  note        String?
+
+  @@index([type, receivedAt])
+}
